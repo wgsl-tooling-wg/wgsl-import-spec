@@ -1,14 +1,31 @@
-# Summary
-We propose adding an importing mechanism to the WGSL shading language as an extension.
+# Imports and Modules
 
-# Motivation
-When writing bigger WGSL shaders, one tends to **split the code into reusable pieces**. Examples are re-using a set of lighting calculation functions and sharing a struct between two compute shaders.
+## Motivation
 
-However, current WGSL tooling is not built for this. The official language purposefully does not include this feature, nor does it provide adjacent features like namespaces, and there is no standardized extension yet.
+When authoring bigger WGSL shaders, people typically **split code into reusable pieces**. Examples are reusable functions for lighting calculation or sharing a struct between two compute shaders.
 
-We also should account for **importing shader from libraries**. Ideally, users could upload WGSL shaders to existing package managers, which other users could then consume.
+Secondly, we want a module system that enables **importing shader from libraries**. Authors should be able to upload WGSL shaders to existing package managers, which other users can consume.
 
-Finally, we want **multiple tools** which can compile WGSL-with-imports down to raw WGSL. Using WGSL-with-imports both in Rust projects and in web projects should be possible.
+Finally, we want to enable **tooling** which natively understands import statements. Such tooling should exist for all WebGPU implementations and not be tied to a specific one.
+
+### Example
+
+The import in this example is derived from shaders in [the Bevy game engine](https://github.com/bevyengine/bevy/blob/9db9f9be2cfed58b39c7393e0cf9f50cc2321310/assets/shaders/show_prepass.wesl#L1-L3).
+
+```wesl
+import bevy_pbr::render::{
+  mesh_view_bindings::globals, 
+  forward_io::VertexOutput
+};
+
+import package::utils;
+
+@fragment
+fn fragment(mesh: VertexOutput) -> @location(0) vec43 {
+  let color = utils::gamma(mesh.color);
+  return color * globals.ambient_light;
+}
+```
 
 # Guide-level explanation
 The `import` statement extension brings item or module names into scope.
@@ -85,9 +102,7 @@ import_collection:
 Where `translation_unit` and `ident` are defined in the WGSL grammar.
 `ident`s must not be current WGSL keywords. `ident`s also must not be
 current WESL keywords: `as`, `import`, `package`, `public`, `self`, or `super`.
-Reserved words that are
-not current keywords are allowed, 
-but not recommended.
+Reserved words that are not current keywords are allowed, but not recommended.
 Lint tools may optionally warn when reserved words are used. 
 
 Attributes may precede an import statement, notably `@if` for
@@ -111,22 +126,6 @@ After collection flattening, each `public import` must resolve to a single item.
 The forms `public import path::*` and `public import some_module;` are not yet
 assigned a meaning and are reserved.
 
-WESL also extends WGSL's `global_directive` rule with a *module attribute*: a `@!`-prefixed attribute that carries module-level metadata. It is used by `@!wildcardable` (see [Wildcard imports](#wildcard-imports)) and is otherwise reserved for future use.
-
-```ebnf
-global_directive:
-| ... // existing WGSL forms
-| module_attribute_directive
-
-module_attribute_directive:
-| '@' '!' ident_pattern_token argument_expression_list? ';'
-```
-
-A module attribute is written like a WGSL `attribute` with a `!` immediately
-after the `@`, and is terminated with `;`; `ident_pattern_token` and
-`argument_expression_list` are the WGSL rules. Like other global directives,
-module attributes appear after any imports and before any global declarations,
-and apply to the module they appear in.
 
 ### Import bindings
 
@@ -336,7 +335,7 @@ The filesystem resolution maps:
 
 Due to filesystem limitations, it can happen that WESL idents are invalid file or folder names.
 Notable examples are `CON, PRN, AUX, NUL, COM1 - COM9, LPT1 - LPT9` on Windows, and Windows being case-insensitive.
-We do not take these restrictions into account, instead we just recommend that WESL programmers avoid these special names.
+We do not take these restrictions into account, instead we recommend avoiding these special names.
 
 ## Non-Filesystem Resolution
 
@@ -642,9 +641,6 @@ a first segment refers to a bound name when one is in scope, and otherwise to
 a package (see [Inline Usage](#inline-usage)). Tools may warn about the
 shadowing.
 
-## Directives
-Under discussion, see: <https://github.com/webgpu-tools/wesl-spec/issues/71>
-
 ## Side-effects and `const_assert`
 Generally, WGSL elements are included if they are recursively used from the main module ([statically accessed](https://www.w3.org/TR/WGSL/#statically-accessed)).
 An import statement by itself doesn't have any side effects. It does not bring in `const_assert`s.
@@ -683,9 +679,6 @@ const a: u32 = bar::baz::hello;
 `const_assert`s inside functions are treated specially! They can get eliminated during dead-code elimination, which is an observable side-effect.
 [WESL deviates from WGSL here](https://github.com/webgpu-tools/wesl-spec/issues/93).
 
-## Name Mangling
-See [Name Mangling](./NameMangling.md)
-
 ## Dead Code Elimination
 Linkers may choose to do dead code elimination, but it is a non-observable implementation detail.
 
@@ -700,36 +693,6 @@ Are there reasons as to why we should not do this?
 
 # Rationale and alternatives
 
-## Not agreeing on a standard
-One major upside of standardizing it is that it becomes practical for language servers to support it.
-
-The usual alternative is that one library, like shaderc, becomes very popular and the standard ends up being "whatever popular library XYZ does".
-
-An open process lets us find a better solution.
-
-## Preprocessor `#include <lighting.wgsl>`
-One alternative, which is common in the GLSL and C worlds, is an including mechanism which simply copy-pastes existing code. A major upside is that this is very simple to implement.
-
-One drawback is that importing the same shader multiple times, which can also happen indirectly, does not work without other preprocessor features.
-
-```c
-// A.wgsl
-#include <lighting.wgsl>
-#include <math.wgsl>
-```
-
-```c
-// lighting.wgsl
-#include <math.wgsl>
-```
-
-would not work, since anything defined in `math.wgsl` would be imported twice. In C-land, this is solved by using *include guards*.
-
-Another drawback is that using the same name twice is impossible. In C-land, this leads to pseudo-namespaces, where major libraries will prefix all of their functions with a few symbols. An example of this is the Vulkan API `vkBeginCommandBuffer` or `vkCmdDraw`.
-
-A future drawback is that "privacy" or "visibility" becomes very difficult to implement. Everything that is imported is automatically public and easily accessible.
-In C-land, the workaround is using header files. In other languages, such as Python, the convention ends up being "anything prefixed with an underscore `_` is private".
-
 ## TypeScript-like imports
 The Bevy team, with a large shader codebase, had a few wishes
 
@@ -741,42 +704,6 @@ To fully copy Rust's importing syntax, one needs something akin to a `mod` state
 The rules have carefully been architected to imitate the Rust style, while not requiring an explicit `mod` statement.
 
 In Rust, `use foo::bar;` could either map to "import an item called `bar` from `foo.rs`" or it could map to "import the module `foo/bar.rs`". Rust uses the explicit `mod` statement to disambiguate. We instead decide at each reference: a bare `bar` is the item, and `bar::baz` reaches into the module.
-
-## Putting exports in comments
-This would have the advantage of letting some existing WGSL tools ignore the new syntax. For example, a WGSL formatter would not need to know about imports, and could just format the code as usual.
-
-## Using an alternative shader language
-There are multiple higher level shading languages, such as [slang](https://github.com/shader-slang/slang) or [Rust-GPU](https://github.com/EmbarkStudios/rust-gpu) which support imports. They also support more features that WGSL currently does not offer. For complex projects, this can very much pay off.
-
-The downside is using additional tooling, and dealing with an additional translation layer.
-An additional translation layer could lock shader authors out of certain WGSL features.
-
-Also, higher level GPU languages are typically processed at build time,
-which precludes using language features to adapt to runtime conditions
-like GPU characteristics or user settings.
-
-## Composing shader code as strings at runtime
-One alternative is to compose shader code at runtime
-by simply joining together strings with WGSL code, perhaps
-with some string templating for flexibility.
-This has the major downside of not being statically analyzable.
-The IDE cannot provide autocompletion,
-and a language server cannot check for errors.
-
-A linker that understands imports also typically
-composes shader strings, and can link at runtime.
-But a linker uses its more sophisticated understanding of WGSL
-to drive composition.
-For example, a linker can identify imports
-that are needed by other imports,
-automating shader composition for users.
-
-# Implementation
-Implemented in the [JavaScript/TypeScript](https://github.com/webgpu-tools/wesl-js) and [Rust](https://github.com/webgpu-tools/wesl-rs) linkers.
-
-# Test cases
-Test cases are available on
-[GitHub](https://github.com/webgpu-tools/wesl-testsuite).
 
 # Future possibilities
 
